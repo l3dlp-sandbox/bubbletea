@@ -18,13 +18,13 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
-	"github.com/containerd/console"
-	isatty "github.com/mattn/go-isatty"
 	"github.com/muesli/cancelreader"
 	"github.com/muesli/termenv"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/term"
 )
 
 // ErrProgramKilled is returned by [Program.Run] when the program got killed.
@@ -58,8 +58,6 @@ type Model interface {
 // update function.
 type Cmd func() Msg
 
-type handlers []chan struct{}
-
 type inputType int
 
 const (
@@ -82,7 +80,7 @@ func (i inputType) String() string {
 // generally set with ProgramOptions.
 //
 // The options here are treated as bits.
-type startupOptions byte
+type startupOptions int16
 
 func (s startupOptions) has(option startupOptions) bool {
 	return s&option != 0
@@ -94,13 +92,37 @@ const (
 	withMouseAllMotion
 	withANSICompressor
 	withoutSignalHandler
-
 	// Catching panics is incredibly useful for restoring the terminal to a
 	// usable state after a panic occurs. When this is set, Bubble Tea will
 	// recover from panics, print the stack trace, and disable raw mode. This
 	// feature is on by default.
 	withoutCatchPanics
+	withoutBracketedPaste
 )
+
+// channelHandlers manages the series of channels returned by various processes.
+// It allows us to wait for those processes to terminate before exiting the
+// program.
+type channelHandlers []chan struct{}
+
+// Adds a channel to the list of handlers. We wait for all handlers to terminate
+// gracefully on shutdown.
+func (h *channelHandlers) add(ch chan struct{}) {
+	*h = append(*h, ch)
+}
+
+// shutdown waits for all handlers to terminate.
+func (h channelHandlers) shutdown() {
+	var wg sync.WaitGroup
+	for _, ch := range h {
+		wg.Add(1)
+		go func(ch chan struct{}) {
+			<-ch
+			wg.Done()
+		}(ch)
+	}
+	wg.Wait()
+}
 
 // Program is a terminal user interface.
 type Program struct {
@@ -125,25 +147,24 @@ type Program struct {
 	renderer      renderer
 
 	// where to read inputs from, this will usually be os.Stdin.
-	input        io.Reader
-	cancelReader cancelreader.CancelReader
-	readLoopDone chan struct{}
-	console      console.Console
+	input io.Reader
+	// tty is null if input is not a TTY.
+	tty              *os.File
+	previousTtyState *term.State
+	cancelReader     cancelreader.CancelReader
+	readLoopDone     chan struct{}
 
 	// was the altscreen active before releasing the terminal?
 	altScreenWasActive bool
-	ignoreSignals      bool
+	ignoreSignals      uint32
 
-	// Stores the original reference to stdin for cases where input is not a
-	// TTY on windows and we've automatically opened CONIN$ to receive input.
-	// When the program exits this will be restored.
-	//
-	// Lint ignore note: the linter will find false positive on unix systems
-	// as this value only comes into play on Windows, hence the ignore comment
-	// below.
-	windowsStdin *os.File //nolint:golint,structcheck,unused
+	bpWasActive bool // was the bracketed paste mode active before releasing the terminal?
 
 	filter func(Model, Msg) Msg
+
+	// fps is the frames per second we should set on the renderer, if
+	// applicable,
+	fps int
 }
 
 // Quit is a special command that tells the Bubble Tea program to exit.
@@ -213,7 +234,7 @@ func (p *Program) handleSignals() chan struct{} {
 				return
 
 			case <-sig:
-				if !p.ignoreSignals {
+				if atomic.LoadUint32(&p.ignoreSignals) == 0 {
 					p.msgs <- QuitMsg{}
 					return
 				}
@@ -228,7 +249,7 @@ func (p *Program) handleSignals() chan struct{} {
 func (p *Program) handleResize() chan struct{} {
 	ch := make(chan struct{})
 
-	if f, ok := p.output.TTY().(*os.File); ok && isatty.IsTerminal(f.Fd()) {
+	if f, ok := p.output.TTY().(*os.File); ok && term.IsTerminal(int(f.Fd())) {
 		// Get the initial terminal size and send it to the program.
 		go p.checkResize()
 
@@ -275,6 +296,12 @@ func (p *Program) handleCommands(cmds chan Cmd) chan struct{} {
 	return ch
 }
 
+func (p *Program) disableMouse() {
+	p.renderer.disableMouseCellMotion()
+	p.renderer.disableMouseAllMotion()
+	p.renderer.disableMouseSGRMode()
+}
+
 // eventLoop is the central message loop. It receives and handles the default
 // Bubble Tea messages, update the model and triggers redraws.
 func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
@@ -309,21 +336,30 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 			case exitAltScreenMsg:
 				p.renderer.exitAltScreen()
 
-			case enableMouseCellMotionMsg:
-				p.renderer.enableMouseCellMotion()
-
-			case enableMouseAllMotionMsg:
-				p.renderer.enableMouseAllMotion()
+			case enableMouseCellMotionMsg, enableMouseAllMotionMsg:
+				switch msg.(type) {
+				case enableMouseCellMotionMsg:
+					p.renderer.enableMouseCellMotion()
+				case enableMouseAllMotionMsg:
+					p.renderer.enableMouseAllMotion()
+				}
+				// mouse mode (1006) is a no-op if the terminal doesn't support it.
+				p.renderer.enableMouseSGRMode()
 
 			case disableMouseMsg:
-				p.renderer.disableMouseCellMotion()
-				p.renderer.disableMouseAllMotion()
+				p.disableMouse()
 
 			case showCursorMsg:
 				p.renderer.showCursor()
 
 			case hideCursorMsg:
 				p.renderer.hideCursor()
+
+			case enableBracketedPasteMsg:
+				p.renderer.enableBracketedPaste()
+
+			case disableBracketedPasteMsg:
+				p.renderer.disableBracketedPaste()
 
 			case execMsg:
 				// NB: this blocks.
@@ -362,6 +398,9 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 						p.Send(msg)
 					}
 				}()
+
+			case setWindowTitleMsg:
+				p.SetWindowTitle(string(msg))
 			}
 
 			// Process internal messages for the renderer.
@@ -381,7 +420,7 @@ func (p *Program) eventLoop(model Model, cmds chan Cmd) (Model, error) {
 // terminated by either [Program.Quit], [Program.Kill], or its signal handler.
 // Returns the final model.
 func (p *Program) Run() (Model, error) {
-	handlers := handlers{}
+	handlers := channelHandlers{}
 	cmds := make(chan Cmd)
 	p.errs = make(chan error)
 	p.finished = make(chan struct{}, 1)
@@ -391,6 +430,27 @@ func (p *Program) Run() (Model, error) {
 	switch p.inputType {
 	case defaultInput:
 		p.input = os.Stdin
+
+		// The user has not set a custom input, so we need to check whether or
+		// not standard input is a terminal. If it's not, we open a new TTY for
+		// input. This will allow things to "just work" in cases where data was
+		// piped in or redirected to the application.
+		//
+		// To disable input entirely pass nil to the [WithInput] program option.
+		f, isFile := p.input.(*os.File)
+		if !isFile {
+			break
+		}
+		if term.IsTerminal(int(f.Fd())) {
+			break
+		}
+
+		f, err := openInputTTY()
+		if err != nil {
+			return p.initialModel, err
+		}
+		defer f.Close() //nolint:errcheck
+		p.input = f
 
 	case ttyInput:
 		// Open a new TTY, by request
@@ -402,24 +462,7 @@ func (p *Program) Run() (Model, error) {
 		p.input = f
 
 	case customInput:
-		// If the user hasn't set a custom input, and input's not a terminal,
-		// open a TTY so we can capture input as normal. This will allow things
-		// to "just work" in cases where data was piped or redirected into this
-		// application.
-		f, isFile := p.input.(*os.File)
-		if !isFile {
-			break
-		}
-		if isatty.IsTerminal(f.Fd()) {
-			break
-		}
-
-		f, err := openInputTTY()
-		if err != nil {
-			return p.initialModel, err
-		}
-		defer f.Close() //nolint:errcheck
-		p.input = f
+		// (There is nothing extra to do.)
 	}
 
 	// Handle signals.
@@ -441,7 +484,7 @@ func (p *Program) Run() (Model, error) {
 
 	// If no renderer is set use the standard one.
 	if p.renderer == nil {
-		p.renderer = newRenderer(p.output, p.startupOptions.has(withANSICompressor))
+		p.renderer = newRenderer(p.output, p.startupOptions.has(withANSICompressor), p.fps)
 	}
 
 	// Check if output is a TTY before entering raw mode, hiding the cursor and
@@ -454,11 +497,19 @@ func (p *Program) Run() (Model, error) {
 	if p.startupOptions&withAltScreen != 0 {
 		p.renderer.enterAltScreen()
 	}
+	if p.startupOptions&withoutBracketedPaste == 0 {
+		p.renderer.enableBracketedPaste()
+	}
 	if p.startupOptions&withMouseCellMotion != 0 {
 		p.renderer.enableMouseCellMotion()
+		p.renderer.enableMouseSGRMode()
 	} else if p.startupOptions&withMouseAllMotion != 0 {
 		p.renderer.enableMouseAllMotion()
+		p.renderer.enableMouseSGRMode()
 	}
+
+	// Start the renderer.
+	p.renderer.start()
 
 	// Initialize the program.
 	model := p.initialModel
@@ -475,9 +526,6 @@ func (p *Program) Run() (Model, error) {
 			}
 		}()
 	}
-
-	// Start the renderer.
-	p.renderer.start()
 
 	// Render the initial view.
 	p.renderer.write(model.View())
@@ -603,7 +651,7 @@ func (p *Program) shutdown(kill bool) {
 // ReleaseTerminal restores the original terminal state and cancels the input
 // reader. You can return control to the Program with RestoreTerminal.
 func (p *Program) ReleaseTerminal() error {
-	p.ignoreSignals = true
+	atomic.StoreUint32(&p.ignoreSignals, 1)
 	p.cancelReader.Cancel()
 	p.waitForReadLoop()
 
@@ -612,6 +660,7 @@ func (p *Program) ReleaseTerminal() error {
 	}
 
 	p.altScreenWasActive = p.renderer.altScreen()
+	p.bpWasActive = p.renderer.bracketedPasteActive()
 	return p.restoreTerminalState()
 }
 
@@ -619,7 +668,7 @@ func (p *Program) ReleaseTerminal() error {
 // terminal to the former state when the program was running, and repaints.
 // Use it to reinitialize a Program after running ReleaseTerminal.
 func (p *Program) RestoreTerminal() error {
-	p.ignoreSignals = false
+	atomic.StoreUint32(&p.ignoreSignals, 0)
 
 	if err := p.initTerminal(); err != nil {
 		return err
@@ -627,7 +676,6 @@ func (p *Program) RestoreTerminal() error {
 	if err := p.initCancelReader(); err != nil {
 		return err
 	}
-
 	if p.altScreenWasActive {
 		p.renderer.enterAltScreen()
 	} else {
@@ -636,6 +684,9 @@ func (p *Program) RestoreTerminal() error {
 	}
 	if p.renderer != nil {
 		p.renderer.start()
+	}
+	if p.bpWasActive {
+		p.renderer.enableBracketedPaste()
 	}
 
 	// If the output is a terminal, it may have been resized while another
@@ -669,23 +720,4 @@ func (p *Program) Printf(template string, args ...interface{}) {
 	p.msgs <- printLineMessage{
 		messageBody: fmt.Sprintf(template, args...),
 	}
-}
-
-// Adds a handler to the list of handlers. We wait for all handlers to terminate
-// gracefully on shutdown.
-func (h *handlers) add(ch chan struct{}) {
-	*h = append(*h, ch)
-}
-
-// Shutdown waits for all handlers to terminate.
-func (h handlers) shutdown() {
-	var wg sync.WaitGroup
-	for _, ch := range h {
-		wg.Add(1)
-		go func(ch chan struct{}) {
-			<-ch
-			wg.Done()
-		}(ch)
-	}
-	wg.Wait()
 }

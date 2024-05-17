@@ -2,6 +2,7 @@ package tea
 
 import (
 	"bytes"
+	"sync/atomic"
 	"testing"
 )
 
@@ -37,7 +38,7 @@ func TestOptions(t *testing.T) {
 
 	t.Run("without signals", func(t *testing.T) {
 		p := NewProgram(nil, WithoutSignals())
-		if !p.ignoreSignals {
+		if atomic.LoadUint32(&p.ignoreSignals) == 0 {
 			t.Errorf("ignore signals should have been set")
 		}
 	})
@@ -80,6 +81,10 @@ func TestOptions(t *testing.T) {
 			exercise(t, WithAltScreen(), withAltScreen)
 		})
 
+		t.Run("bracketed paste disabled", func(t *testing.T) {
+			exercise(t, WithoutBracketedPaste(), withoutBracketedPaste)
+		})
+
 		t.Run("ansi compression", func(t *testing.T) {
 			exercise(t, WithANSICompressor(), withANSICompressor)
 		})
@@ -114,8 +119,8 @@ func TestOptions(t *testing.T) {
 	})
 
 	t.Run("multiple", func(t *testing.T) {
-		p := NewProgram(nil, WithMouseAllMotion(), WithAltScreen(), WithInputTTY())
-		for _, opt := range []startupOptions{withMouseAllMotion, withAltScreen} {
+		p := NewProgram(nil, WithMouseAllMotion(), WithoutBracketedPaste(), WithAltScreen(), WithInputTTY())
+		for _, opt := range []startupOptions{withMouseAllMotion, withoutBracketedPaste, withAltScreen} {
 			if !p.startupOptions.has(opt) {
 				t.Errorf("expected startup options have %v, got %v", opt, p.startupOptions)
 			}
